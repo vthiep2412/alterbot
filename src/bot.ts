@@ -5,79 +5,121 @@ import CONFIG from "../config.json" with {type: 'json'};
 
 let loop: NodeJS.Timer;
 let bot: Mineflayer.Bot;
+let isReconnecting = false; // Prevent multiple reconnect attempts
 
-// Get config from env vars with fallback to config.json
-const getConfig = () => ({
-        host: process.env.HOST || CONFIG.client.host,
-        port: process.env.PORT || CONFIG.client.port,
-        username: process.env.USERNAME || CONFIG.client.username,
-        retryDelay: process.env.RETRY_DELAY ? +process.env.RETRY_DELAY : CONFIG.action.retryDelay,
-        initialRetryDelay: process.env.INITIAL_RETRY_DELAY ? +process.env.INITIAL_RETRY_DELAY : 60000, // 1 minute default
+// Runtime config that can be changed via HTTP API
+let runtimeConfig = {
+        host: process.env.MC_HOST || CONFIG.client.host,
+        port: process.env.MC_PORT || CONFIG.client.port,
+        username: process.env.BOT_USERNAME || CONFIG.client.username,
+};
+
+const retryDelay = process.env.RETRY_DELAY ? +process.env.RETRY_DELAY : CONFIG.action.retryDelay;
+const initialRetryDelay = process.env.INITIAL_RETRY_DELAY ? +process.env.INITIAL_RETRY_DELAY : 60000;
+
+// Export function to update config at runtime (called from web.ts)
+export const updateConfig = (newConfig: { host?: string; port?: string; username?: string }) => {
+        if (newConfig.host) runtimeConfig.host = newConfig.host;
+        if (newConfig.port) runtimeConfig.port = newConfig.port;
+        if (newConfig.username) runtimeConfig.username = newConfig.username;
+        console.log(`[CONFIG] Updated: ${JSON.stringify(runtimeConfig)}`);
+};
+
+// Export function to restart the bot (called from web.ts)
+export const restartBot = () => {
+        console.log('[BOT] Restarting with new config...');
+        isReconnecting = false; // Reset flag for manual restart
+        disconnect();
+        createBot();
+};
+
+export const getStatus = () => ({
+        connected: bot?.entity ? true : false,
+        username: bot?.username || null,
+        config: runtimeConfig,
 });
 
 const disconnect = (): void => {
         clearInterval(loop);
-        bot?.quit?.();
-        bot?.end?.();
+        if (bot) {
+                bot.removeAllListeners();
+                bot?.quit?.();
+                bot?.end?.();
+        }
 };
 
-const reconnect = async (): Promise<void> => {
-        const config = getConfig();
-        console.log(`Trying to reconnect in ${config.retryDelay / 1000} seconds...\n`);
-
+const scheduleReconnect = async (delay: number, reason: string): Promise<void> => {
+        if (isReconnecting) {
+                console.log('[BOT] Reconnect already scheduled, skipping...');
+                return;
+        }
+        
+        isReconnecting = true;
+        console.log(`[BOT] ${reason}. Reconnecting in ${delay / 1000}s...`);
+        
         disconnect();
-        await sleep(config.retryDelay);
+        await sleep(delay);
+        
+        isReconnecting = false;
         createBot();
-        return;
 };
 
 const createBot = (): void => {
-        const config = getConfig();
-        
-        console.log(`Connecting to ${config.host}:${config.port} as ${config.username}...`);
+        console.log(`[BOT] Connecting to ${runtimeConfig.host}:${runtimeConfig.port} as ${runtimeConfig.username}...`);
         
         bot = Mineflayer.createBot({
-                host: config.host,
-                port: +config.port,
-                username: config.username
+                host: runtimeConfig.host,
+                port: +runtimeConfig.port,
+                username: runtimeConfig.username
         } as const);
 
+        let hasConnected = false;
 
-        bot.once('error', async (error) => {
-                console.error(`AFKBot got an error: ${error}`);
+        bot.once('error', (error) => {
+                console.error(`[ERROR] ${error}`);
                 
-                // Retry on initial connection error
-                console.log(`Connection failed. Retrying in ${config.initialRetryDelay / 1000} seconds (1 minute)...`);
-                disconnect();
-                await sleep(config.initialRetryDelay);
-                createBot();
+                if (!hasConnected) {
+                        // Initial connection failed - use longer delay
+                        scheduleReconnect(initialRetryDelay, 'Initial connection failed');
+                }
+                // If already connected, the 'end' event will handle reconnection
         });
         
         bot.once('kicked', rawResponse => {
-                console.error(`\n\nAFKbot is disconnected: ${rawResponse}`);
+                console.log(`[KICKED] ${rawResponse}`);
         });
-        bot.once('end', () => void reconnect());
+        
+        bot.once('end', (reason) => {
+                console.log(`[DISCONNECTED] ${reason || 'Connection ended'}`);
+                
+                if (hasConnected) {
+                        // Was connected before, use shorter delay
+                        scheduleReconnect(retryDelay, 'Disconnected from server');
+                }
+                // If never connected, 'error' handler already scheduled reconnect
+        });
 
         bot.once('spawn', () => {
+                hasConnected = true;
+                
                 const changePos = async (): Promise<void> => {
                         const lastAction = getRandom(CONFIG.action.commands) as Mineflayer.ControlState;
-                        const halfChance: boolean = Math.random() < 0.5? true : false; // 50% chance to sprint
+                        const halfChance: boolean = Math.random() < 0.5;
 
-                        console.debug(`${lastAction}${halfChance? " with sprinting" : ''}`);
+                        console.debug(`[ACTION] ${lastAction}${halfChance ? " with sprinting" : ''}`);
 
                         bot.setControlState('sprint', halfChance);
-                        bot.setControlState(lastAction, true); // starts the selected random action
+                        bot.setControlState(lastAction, true);
 
                         await sleep(CONFIG.action.holdDuration);
                         bot.clearControlStates();
-                        return;
                 };
+                
                 const changeView = async (): Promise<void> => {
                         const yaw = (Math.random() * Math.PI) - (0.5 * Math.PI),
                                 pitch = (Math.random() * Math.PI) - (0.5 * Math.PI);
                         
                         await bot.look(yaw, pitch, false);
-                        return;
                 };
                 
                 loop = setInterval(() => {
@@ -85,8 +127,10 @@ const createBot = (): void => {
                         changePos();
                 }, CONFIG.action.holdDuration);
         });
+        
         bot.once('login', () => {
-                console.log(`AFKBot logged in ${bot.username}\n\n`);
+                hasConnected = true;
+                console.log(`[LOGIN] ${bot.username} connected successfully`);
         });
 };
 
